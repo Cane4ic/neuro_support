@@ -1,10 +1,15 @@
 import logging
 import os
+import time
+from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from postgrest.exceptions import APIError
+from pydantic import ValidationError
 from supabase import Client, create_client
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import Conflict
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -62,10 +67,55 @@ def _ts_now() -> str:
     return utc_now_iso()
 
 
+def _is_transient_supabase_failure(exc: BaseException) -> bool:
+    """502/503 от API, HTML вместо JSON и т.п."""
+    if isinstance(exc, ValidationError):
+        es = str(exc).lower()
+        if "json" in es or "invalid" in es:
+            return True
+    msg = str(exc).lower()
+    if "502" in msg or "503" in msg or "504" in msg:
+        return True
+    if "bad gateway" in msg or "service unavailable" in msg or "gateway time" in msg:
+        return True
+    if isinstance(exc, APIError):
+        code = (exc.code or "") or ""
+        if code in ("502", "503", "504", "PGRST301", "PGRST302"):
+            return True
+    return False
+
+
+def supabase_execute(build: Callable[[], Any], *, retries: int = 4) -> Any:
+    """
+    postgrest при 502 иногда отдаёт HTML — падает парсинг JSON.
+    Повторяем запрос с backoff (кратковременные сбои Supabase/CDN).
+    """
+    last: Optional[BaseException] = None
+    for attempt in range(retries):
+        try:
+            return build().execute()
+        except Exception as exc:
+            last = exc
+            if attempt < retries - 1 and _is_transient_supabase_failure(exc):
+                delay = 0.35 * (2**attempt)
+                logging.warning(
+                    "Supabase: временная ошибка, повтор через %.1fs (%s/%s): %s",
+                    delay,
+                    attempt + 1,
+                    retries,
+                    exc,
+                )
+                time.sleep(delay)
+                continue
+            raise
+    assert last is not None
+    raise last
+
+
 def init_db() -> None:
     sb = get_supabase()
     try:
-        sb.table("tickets").select("id").limit(1).execute()
+        supabase_execute(lambda: sb.table("tickets").select("id").limit(1))
     except Exception as exc:
         raise RuntimeError(
             "Не удаётся прочитать таблицу tickets. Выполните SQL из supabase/schema.sql "
@@ -75,14 +125,13 @@ def init_db() -> None:
 
 def get_open_ticket_for_user(user_id: int) -> Optional[dict[str, Any]]:
     sb = get_supabase()
-    res = (
-        sb.table("tickets")
+    res = supabase_execute(
+        lambda: sb.table("tickets")
         .select("*")
         .eq("user_id", user_id)
         .in_("status", ["pending", "active"])
         .order("id", desc=True)
         .limit(1)
-        .execute()
     )
     rows = res.data or []
     return rows[0] if rows else None
@@ -90,14 +139,13 @@ def get_open_ticket_for_user(user_id: int) -> Optional[dict[str, Any]]:
 
 def get_active_ticket_for_agent(agent_id: int) -> Optional[dict[str, Any]]:
     sb = get_supabase()
-    res = (
-        sb.table("tickets")
+    res = supabase_execute(
+        lambda: sb.table("tickets")
         .select("*")
         .eq("assigned_agent_id", agent_id)
         .eq("status", "active")
         .order("id", desc=True)
         .limit(1)
-        .execute()
     )
     rows = res.data or []
     return rows[0] if rows else None
@@ -106,16 +154,18 @@ def get_active_ticket_for_agent(agent_id: int) -> Optional[dict[str, Any]]:
 def create_ticket(user_id: int) -> int:
     now = _ts_now()
     sb = get_supabase()
-    res = sb.table("tickets").insert(
-        {
-            "user_id": user_id,
-            "status": "pending",
-            "assigned_agent_id": None,
-            "created_at": now,
-            "updated_at": now,
-            "closed_at": None,
-        }
-    ).execute()
+    res = supabase_execute(
+        lambda: sb.table("tickets").insert(
+            {
+                "user_id": user_id,
+                "status": "pending",
+                "assigned_agent_id": None,
+                "created_at": now,
+                "updated_at": now,
+                "closed_at": None,
+            }
+        )
+    )
     rows = res.data or []
     if not rows:
         raise RuntimeError("Не удалось создать тикет")
@@ -128,18 +178,17 @@ def set_ticket_status(ticket_id: int, status: str, agent_id: Optional[int] = Non
     payload: dict[str, Any] = {"status": status, "assigned_agent_id": agent_id, "updated_at": now}
     if close:
         payload["closed_at"] = now
-    sb.table("tickets").update(payload).eq("id", ticket_id).execute()
+    supabase_execute(lambda: sb.table("tickets").update(payload).eq("id", ticket_id))
 
 
 def try_accept_ticket(ticket_id: int, agent_id: int) -> bool:
     now = _ts_now()
     sb = get_supabase()
-    res = (
-        sb.table("tickets")
+    res = supabase_execute(
+        lambda: sb.table("tickets")
         .update({"status": "active", "assigned_agent_id": agent_id, "updated_at": now})
         .eq("id", ticket_id)
         .eq("status", "pending")
-        .execute()
     )
     rows = res.data or []
     return bool(rows)
@@ -147,47 +196,54 @@ def try_accept_ticket(ticket_id: int, agent_id: int) -> bool:
 
 def get_ticket(ticket_id: int) -> Optional[dict[str, Any]]:
     sb = get_supabase()
-    res = sb.table("tickets").select("*").eq("id", ticket_id).limit(1).execute()
+    res = supabase_execute(lambda: sb.table("tickets").select("*").eq("id", ticket_id).limit(1))
     rows = res.data or []
     return rows[0] if rows else None
 
 
 def save_decision(ticket_id: int, agent_id: int, decision: str) -> None:
     sb = get_supabase()
-    sb.table("ticket_agent_decisions").upsert(
-        {
-            "ticket_id": ticket_id,
-            "agent_id": agent_id,
-            "decision": decision,
-            "decided_at": _ts_now(),
-        },
-        on_conflict="ticket_id,agent_id",
-    ).execute()
+    supabase_execute(
+        lambda: sb.table("ticket_agent_decisions").upsert(
+            {
+                "ticket_id": ticket_id,
+                "agent_id": agent_id,
+                "decision": decision,
+                "decided_at": _ts_now(),
+            },
+            on_conflict="ticket_id,agent_id",
+        )
+    )
 
 
 def count_rejections(ticket_id: int) -> int:
     sb = get_supabase()
-    res = (
-        sb.table("ticket_agent_decisions")
+    res = supabase_execute(
+        lambda: sb.table("ticket_agent_decisions")
         .select("*", count="exact")
         .eq("ticket_id", ticket_id)
         .eq("decision", "rejected")
-        .execute()
     )
     return int(res.count) if res.count is not None else len(res.data or [])
 
 
 def save_notification(ticket_id: int, agent_id: int, message_id: int) -> None:
     sb = get_supabase()
-    sb.table("ticket_notifications").upsert(
-        {"ticket_id": ticket_id, "agent_id": agent_id, "message_id": message_id},
-        on_conflict="ticket_id,agent_id",
-    ).execute()
+    supabase_execute(
+        lambda: sb.table("ticket_notifications").upsert(
+            {"ticket_id": ticket_id, "agent_id": agent_id, "message_id": message_id},
+            on_conflict="ticket_id,agent_id",
+        )
+    )
 
 
 def get_notifications(ticket_id: int) -> list[dict[str, Any]]:
     sb = get_supabase()
-    res = sb.table("ticket_notifications").select("ticket_id, agent_id, message_id").eq("ticket_id", ticket_id).execute()
+    res = supabase_execute(
+        lambda: sb.table("ticket_notifications")
+        .select("ticket_id, agent_id, message_id")
+        .eq("ticket_id", ticket_id)
+    )
     return list(res.data or [])
 
 
@@ -463,19 +519,31 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await query.answer("Неизвестное действие.", show_alert=True)
 
 
+async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    err = context.error
+    if isinstance(err, Conflict):
+        logging.warning(
+            "Конфликт getUpdates: с тем же BOT_TOKEN уже идёт long polling (второй процесс). "
+            "Остановите дубликат: локальный запуск, второй деплой Railway или старый контейнер."
+        )
+        return
+    logging.error("Ошибка в обработчике Telegram", exc_info=err)
+
+
 def main() -> None:
     if not BOT_TOKEN:
         raise RuntimeError("Не задан BOT_TOKEN")
     if not AGENT_IDS:
         raise RuntimeError("Не задан AGENT_IDS (через запятую: 123,456)")
 
-    init_db()
     logging.basicConfig(
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
         level=logging.INFO,
     )
+    init_db()
 
     application = Application.builder().token(BOT_TOKEN).build()
+    application.add_error_handler(telegram_error_handler)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("my", my_ticket))
     application.add_handler(CommandHandler("finish", finish))
