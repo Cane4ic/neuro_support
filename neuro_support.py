@@ -338,9 +338,19 @@ async def forward_message_between_chats(
     target_chat_id: int,
     ticket_id: int,
     from_agent: bool,
-    peer: User,
+    peer: Optional[User] = None,
 ) -> None:
-    title = f"Агент (тикет #{ticket_id})" if from_agent else f"Пользователь (тикет #{ticket_id})"
+    if from_agent:
+        # Пользователь видит только «как обычное сообщение», без служебных заголовков
+        await context.bot.copy_message(
+            chat_id=target_chat_id,
+            from_chat_id=source_chat_id,
+            message_id=message_id,
+        )
+        return
+    if peer is None:
+        raise RuntimeError("peer обязателен для пересылки сообщения пользователя агенту")
+    title = f"Пользователь (тикет #{ticket_id})"
     await context.bot.send_message(
         chat_id=target_chat_id,
         text=build_message_header(title, peer),
@@ -420,7 +430,6 @@ async def handle_agent_message(update: Update, context: ContextTypes.DEFAULT_TYP
         target_chat_id=int(ticket["user_id"]),
         ticket_id=int(ticket["id"]),
         from_agent=True,
-        peer=user,
     )
 
 
