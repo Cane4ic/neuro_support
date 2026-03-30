@@ -106,21 +106,16 @@ def get_active_ticket_for_agent(agent_id: int) -> Optional[dict[str, Any]]:
 def create_ticket(user_id: int) -> int:
     now = _ts_now()
     sb = get_supabase()
-    res = (
-        sb.table("tickets")
-        .insert(
-            {
-                "user_id": user_id,
-                "status": "pending",
-                "assigned_agent_id": None,
-                "created_at": now,
-                "updated_at": now,
-                "closed_at": None,
-            }
-        )
-        .select("id")
-        .execute()
-    )
+    res = sb.table("tickets").insert(
+        {
+            "user_id": user_id,
+            "status": "pending",
+            "assigned_agent_id": None,
+            "created_at": now,
+            "updated_at": now,
+            "closed_at": None,
+        }
+    ).execute()
     rows = res.data or []
     if not rows:
         raise RuntimeError("Не удалось создать тикет")
@@ -144,7 +139,6 @@ def try_accept_ticket(ticket_id: int, agent_id: int) -> bool:
         .update({"status": "active", "assigned_agent_id": agent_id, "updated_at": now})
         .eq("id", ticket_id)
         .eq("status", "pending")
-        .select("id")
         .execute()
     )
     rows = res.data or []
