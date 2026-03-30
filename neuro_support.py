@@ -3,8 +3,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-import psycopg
-from psycopg.rows import dict_row
+from supabase import Client, create_client
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
@@ -18,7 +17,10 @@ from telegram.ext import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 AGENT_IDS_RAW = os.getenv("AGENT_IDS", "").strip()
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+
+_supabase: Optional[Client] = None
 
 
 def parse_agent_ids(raw: str) -> set[int]:
@@ -41,201 +43,158 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def get_conn() -> psycopg.Connection:
-    if not DATABASE_URL:
-        raise RuntimeError("Не задан DATABASE_URL (Supabase Postgres connection string)")
-    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+def get_supabase() -> Client:
+    global _supabase
+    if _supabase is not None:
+        return _supabase
+    if not SUPABASE_URL:
+        raise RuntimeError("Не задан SUPABASE_URL (https://xxxx.supabase.co)")
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        raise RuntimeError(
+            "Не задан SUPABASE_SERVICE_ROLE_KEY. "
+            "Возьмите service_role в Supabase → Project Settings → API (только для сервера, не публикуйте)."
+        )
+    _supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    return _supabase
+
+
+def _ts_now() -> str:
+    return utc_now_iso()
 
 
 def init_db() -> None:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS tickets (
-                    id BIGSERIAL PRIMARY KEY,
-                    user_id BIGINT NOT NULL,
-                    status TEXT NOT NULL,
-                    assigned_agent_id BIGINT,
-                    created_at TIMESTAMPTZ NOT NULL,
-                    updated_at TIMESTAMPTZ NOT NULL,
-                    closed_at TIMESTAMPTZ
-                )
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS ticket_agent_decisions (
-                    ticket_id BIGINT NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
-                    agent_id BIGINT NOT NULL,
-                    decision TEXT NOT NULL,
-                    decided_at TIMESTAMPTZ NOT NULL,
-                    PRIMARY KEY (ticket_id, agent_id)
-                )
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS ticket_notifications (
-                    ticket_id BIGINT NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
-                    agent_id BIGINT NOT NULL,
-                    message_id BIGINT NOT NULL,
-                    PRIMARY KEY (ticket_id, agent_id)
-                )
-                """
-            )
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_tickets_user_status ON tickets(user_id, status)")
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_tickets_agent_status ON tickets(assigned_agent_id, status)"
-            )
+    sb = get_supabase()
+    try:
+        sb.table("tickets").select("id").limit(1).execute()
+    except Exception as exc:
+        raise RuntimeError(
+            "Не удаётся прочитать таблицу tickets. Выполните SQL из supabase/schema.sql "
+            "в Supabase → SQL Editor."
+        ) from exc
 
 
 def get_open_ticket_for_user(user_id: int) -> Optional[dict[str, Any]]:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT * FROM tickets
-                WHERE user_id = %s AND status IN ('pending', 'active')
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (user_id,),
-            )
-            return cur.fetchone()
+    sb = get_supabase()
+    res = (
+        sb.table("tickets")
+        .select("*")
+        .eq("user_id", user_id)
+        .in_("status", ["pending", "active"])
+        .order("id", desc=True)
+        .limit(1)
+        .execute()
+    )
+    rows = res.data or []
+    return rows[0] if rows else None
 
 
 def get_active_ticket_for_agent(agent_id: int) -> Optional[dict[str, Any]]:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT * FROM tickets
-                WHERE assigned_agent_id = %s AND status = 'active'
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (agent_id,),
-            )
-            return cur.fetchone()
+    sb = get_supabase()
+    res = (
+        sb.table("tickets")
+        .select("*")
+        .eq("assigned_agent_id", agent_id)
+        .eq("status", "active")
+        .order("id", desc=True)
+        .limit(1)
+        .execute()
+    )
+    rows = res.data or []
+    return rows[0] if rows else None
 
 
 def create_ticket(user_id: int) -> int:
-    now = datetime.now(timezone.utc)
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO tickets (user_id, status, assigned_agent_id, created_at, updated_at, closed_at)
-                VALUES (%s, 'pending', NULL, %s, %s, NULL)
-                RETURNING id
-                """,
-                (user_id, now, now),
-            )
-            row = cur.fetchone()
-            if not row:
-                raise RuntimeError("Не удалось создать тикет")
-            return int(row["id"])
+    now = _ts_now()
+    sb = get_supabase()
+    res = (
+        sb.table("tickets")
+        .insert(
+            {
+                "user_id": user_id,
+                "status": "pending",
+                "assigned_agent_id": None,
+                "created_at": now,
+                "updated_at": now,
+                "closed_at": None,
+            }
+        )
+        .select("id")
+        .execute()
+    )
+    rows = res.data or []
+    if not rows:
+        raise RuntimeError("Не удалось создать тикет")
+    return int(rows[0]["id"])
 
 
 def set_ticket_status(ticket_id: int, status: str, agent_id: Optional[int] = None, close: bool = False) -> None:
-    now = datetime.now(timezone.utc)
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            if close:
-                cur.execute(
-                    """
-                    UPDATE tickets
-                    SET status = %s, assigned_agent_id = %s, updated_at = %s, closed_at = %s
-                    WHERE id = %s
-                    """,
-                    (status, agent_id, now, now, ticket_id),
-                )
-            else:
-                cur.execute(
-                    """
-                    UPDATE tickets
-                    SET status = %s, assigned_agent_id = %s, updated_at = %s
-                    WHERE id = %s
-                    """,
-                    (status, agent_id, now, ticket_id),
-                )
+    now = _ts_now()
+    sb = get_supabase()
+    payload: dict[str, Any] = {"status": status, "assigned_agent_id": agent_id, "updated_at": now}
+    if close:
+        payload["closed_at"] = now
+    sb.table("tickets").update(payload).eq("id", ticket_id).execute()
 
 
 def try_accept_ticket(ticket_id: int, agent_id: int) -> bool:
-    now = datetime.now(timezone.utc)
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE tickets
-                SET status = 'active', assigned_agent_id = %s, updated_at = %s
-                WHERE id = %s AND status = 'pending'
-                RETURNING id
-                """,
-                (agent_id, now, ticket_id),
-            )
-            return cur.fetchone() is not None
+    now = _ts_now()
+    sb = get_supabase()
+    res = (
+        sb.table("tickets")
+        .update({"status": "active", "assigned_agent_id": agent_id, "updated_at": now})
+        .eq("id", ticket_id)
+        .eq("status", "pending")
+        .select("id")
+        .execute()
+    )
+    rows = res.data or []
+    return bool(rows)
 
 
 def get_ticket(ticket_id: int) -> Optional[dict[str, Any]]:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM tickets WHERE id = %s", (ticket_id,))
-            return cur.fetchone()
+    sb = get_supabase()
+    res = sb.table("tickets").select("*").eq("id", ticket_id).limit(1).execute()
+    rows = res.data or []
+    return rows[0] if rows else None
 
 
 def save_decision(ticket_id: int, agent_id: int, decision: str) -> None:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO ticket_agent_decisions (ticket_id, agent_id, decision, decided_at)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT(ticket_id, agent_id) DO UPDATE SET
-                  decision = excluded.decision,
-                  decided_at = excluded.decided_at
-                """,
-                (ticket_id, agent_id, decision, datetime.now(timezone.utc)),
-            )
+    sb = get_supabase()
+    sb.table("ticket_agent_decisions").upsert(
+        {
+            "ticket_id": ticket_id,
+            "agent_id": agent_id,
+            "decision": decision,
+            "decided_at": _ts_now(),
+        },
+        on_conflict="ticket_id,agent_id",
+    ).execute()
 
 
 def count_rejections(ticket_id: int) -> int:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT COUNT(*) AS total FROM ticket_agent_decisions
-                WHERE ticket_id = %s AND decision = 'rejected'
-                """,
-                (ticket_id,),
-            )
-            row = cur.fetchone()
-            return int(row["total"]) if row else 0
+    sb = get_supabase()
+    res = (
+        sb.table("ticket_agent_decisions")
+        .select("*", count="exact")
+        .eq("ticket_id", ticket_id)
+        .eq("decision", "rejected")
+        .execute()
+    )
+    return int(res.count) if res.count is not None else len(res.data or [])
 
 
 def save_notification(ticket_id: int, agent_id: int, message_id: int) -> None:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO ticket_notifications (ticket_id, agent_id, message_id)
-                VALUES (%s, %s, %s)
-                ON CONFLICT(ticket_id, agent_id) DO UPDATE SET
-                  message_id = excluded.message_id
-                """,
-                (ticket_id, agent_id, message_id),
-            )
+    sb = get_supabase()
+    sb.table("ticket_notifications").upsert(
+        {"ticket_id": ticket_id, "agent_id": agent_id, "message_id": message_id},
+        on_conflict="ticket_id,agent_id",
+    ).execute()
 
 
 def get_notifications(ticket_id: int) -> list[dict[str, Any]]:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT ticket_id, agent_id, message_id FROM ticket_notifications WHERE ticket_id = %s",
-                (ticket_id,),
-            )
-            return list(cur.fetchall())
+    sb = get_supabase()
+    res = sb.table("ticket_notifications").select("ticket_id, agent_id, message_id").eq("ticket_id", ticket_id).execute()
+    return list(res.data or [])
 
 
 def is_agent(user_id: int) -> bool:
@@ -427,8 +386,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not query or not user:
         return
 
-    await query.answer()
-
     if not is_agent(user.id):
         await query.answer("Только агент может нажимать эти кнопки.", show_alert=True)
         return
@@ -455,11 +412,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.answer("Сначала завершите текущий активный диалог через /finish.", show_alert=True)
             return
 
-        save_decision(ticket_id, user.id, "accepted")
         accepted = try_accept_ticket(ticket_id, user.id)
         if not accepted:
             await query.answer("Тикет уже принят другим агентом.", show_alert=True)
             return
+
+        save_decision(ticket_id, user.id, "accepted")
+        await query.answer("Принято.")
 
         await context.bot.send_message(
             chat_id=ticket["user_id"],
@@ -515,8 +474,6 @@ def main() -> None:
         raise RuntimeError("Не задан BOT_TOKEN")
     if not AGENT_IDS:
         raise RuntimeError("Не задан AGENT_IDS (через запятую: 123,456)")
-    if not DATABASE_URL:
-        raise RuntimeError("Не задан DATABASE_URL (Postgres из Supabase)")
 
     init_db()
     logging.basicConfig(
