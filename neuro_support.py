@@ -8,7 +8,7 @@ from typing import Any, Optional
 from postgrest.exceptions import APIError
 from pydantic import ValidationError
 from supabase import Client, create_client
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, User
 from telegram.error import Conflict
 from telegram.ext import (
     Application,
@@ -321,26 +321,14 @@ async def my_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-def summarize_message(message) -> str:
-    if message.text:
-        return message.text
-    if message.photo:
-        return "[фото]"
-    if message.document:
-        return f"[файл] {message.document.file_name or ''}".strip()
-    if message.voice:
-        return "[voice]"
-    if message.audio:
-        return f"[audio] {message.audio.file_name or ''}".strip()
-    if message.video:
-        return "[video]"
-    if message.video_note:
-        return "[video_note]"
-    if message.sticker:
-        return "[sticker]"
-    if message.caption:
-        return message.caption
-    return "[сообщение]"
+def format_username_line(user: User) -> str:
+    if user.username:
+        return f"Username: @{user.username}"
+    return "Username: не указан"
+
+
+def build_message_header(title: str, user: User) -> str:
+    return f"{title}\n{format_username_line(user)}\nID: {user.id}\n\nСообщение:"
 
 
 async def forward_message_between_chats(
@@ -350,9 +338,13 @@ async def forward_message_between_chats(
     target_chat_id: int,
     ticket_id: int,
     from_agent: bool,
+    peer: User,
 ) -> None:
-    prefix = f"Агент (тикет #{ticket_id}):" if from_agent else f"Пользователь (тикет #{ticket_id}):"
-    await context.bot.send_message(chat_id=target_chat_id, text=prefix)
+    title = f"Агент (тикет #{ticket_id})" if from_agent else f"Пользователь (тикет #{ticket_id})"
+    await context.bot.send_message(
+        chat_id=target_chat_id,
+        text=build_message_header(title, peer),
+    )
     await context.bot.copy_message(
         chat_id=target_chat_id,
         from_chat_id=source_chat_id,
@@ -381,6 +373,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             target_chat_id=agent_id,
             ticket_id=int(ticket["id"]),
             from_agent=False,
+            peer=user,
         )
         return
 
@@ -389,20 +382,20 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     ticket_id = create_ticket(user.id)
-    incoming_text = summarize_message(message)
-    text_for_agent = (
-        f"Новая заявка #{ticket_id}\n"
-        f"User ID: {user.id}\n\n"
-        f"Сообщение:\n{incoming_text}"
-    )
+    header = build_message_header(f"Новая заявка #{ticket_id}", user)
 
     for agent_id in AGENT_IDS:
         sent = await context.bot.send_message(
             chat_id=agent_id,
-            text=text_for_agent,
+            text=header,
             reply_markup=support_keyboard(ticket_id),
         )
         save_notification(ticket_id, agent_id, sent.message_id)
+        await context.bot.copy_message(
+            chat_id=agent_id,
+            from_chat_id=message.chat_id,
+            message_id=message.message_id,
+        )
 
     await message.reply_text("Заявка отправлена. Как только агент примет ее, вы получите уведомление.")
 
@@ -427,6 +420,7 @@ async def handle_agent_message(update: Update, context: ContextTypes.DEFAULT_TYP
         target_chat_id=int(ticket["user_id"]),
         ticket_id=int(ticket["id"]),
         from_agent=True,
+        peer=user,
     )
 
 
